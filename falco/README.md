@@ -102,6 +102,8 @@ The following table lists the configurable parameters of the Falco chart and the
 | `falco.webserver.k8sAuditEndpoint`              | Endpoint where Falco embedded webserver accepts K8s audit events                                                   | `/k8s-audit`                                                                                                                              |
 | `falco.webserver.listenPort`                    | Port where Falco embedded webserver listen to connections                                                          | `8765`                                                                                                                                    |
 | `falco.webserver.nodePort`                      | Exposes the Falco embedded webserver through a NodePort                                                            | `false`                                                                                                                                   |
+| `falco.webserver.sslEnabled`                    | Enable SSL on Falco embedded webserver                                                                             | `false`                                                                                                                              |
+| `falco.webserver.sslCertificate  `              | Certificate bundle path for the Falco embedded webserver                                                           | `/etc/falco/certs/server.pem`                                                                                                                              |
 | `falco.programOutput.enabled`                   | Enable program output for security notifications                                                                   | `false`                                                                                                                                   |
 | `falco.programOutput.keepAlive`                 | Start the program once or re-spawn when a notification arrives                                                     | `false`                                                                                                                                   |
 | `falco.programOutput.program`                   | Command to execute for program output                                                                              | `mail -s "Falco Notification" someone@example.com`                                                                                        |
@@ -116,6 +118,9 @@ The following table lists the configurable parameters of the Falco chart and the
 | `falco.grpc.rootCerts`                          | CA root file path for the Falco gRPC server                                                                        | `/etc/falco/certs/ca.crt`                                                                                                                 |
 | `falco.grpcOutput.enabled`                      | Enable the gRPC output and events will be kept in memory until you read them with a gRPC client.                   | `false`                                                                                                                                   |
 | `customRules`                                   | Third party rules enabled for Falco                                                                                | `{}`                                                                                                                                      |
+| `certs.server.key`                              | Key used by gRPC and webserver                                                                                     | ` `                                                                                                                                       |
+| `certs.server.crt`                              | Certificate used by gRPC and webserver                                                                             | ` `                                                                                                                                       |
+| `certs.ca.crt`                                  | CA certificate used by gRPC, webserver and AuditSink validation                                                    | ` `                                                                                                                                       |
 | `nodeSelector`                                  | The node selection constraint                                                                                      | `{}`                                                                                                                                      |
 | `affinity`                                      | The affinity constraint                                                                                            | `{}`                                                                                                                                      |
 | `tolerations`                                   | The tolerations for scheduling                                                                                     | `node-role.kubernetes.io/master:NoSchedule`                                                                                               |
@@ -202,14 +207,71 @@ And this means that our Falco installation has loaded the rules and is ready to 
 
 This has been tested with Kops and Minikube. You will need the following components:
 
-* A Kubernetes cluster greater than v1.13
+### Using Dynamic Auditing :
+
+* A Kubernetes cluster greater than v1.13 (for kops, starting with 1.18.0)
 * The apiserver must be configured with Dynamic Auditing feature, do it with the following flags:
   * `--audit-dynamic-configuration`
   * `--feature-gates=DynamicAuditing=true`
   * `--runtime-config=auditregistration.k8s.io/v1alpha1=true`
 
-You can do it with the [scripts provided by Falco engineers](https://github.com/falcosecurity/evolution/tree/master/examples/k8s_audit_config)
-just running:
+Using kops 1.18.0+ `kops edit cluster`, ensure these options are present:
+```yaml
+spec:
+  kubeAPIServer:
+    auditDynamicConfiguration: true
+    auditPolicyFile: /srv/kubernetes/assets/audit-policy.yaml
+    runtimeConfig:
+      auditregistration.k8s.io/v1alpha1: "true"
+    featureGates:
+      DynamicAuditing: "true"
+  fileAssets:
+  - content: |
+      # ... paste audit-policy.yaml here ...
+      # https://raw.githubusercontent.com/falcosecurity/evolution/master/examples/k8s_audit_config/audit-policy.yaml
+    name: audit-policy.yaml
+    roles:
+    - Master
+```
+
+Dynamic auditing can only be enabled with a valid certificate on the Falco webserver. To generate:
+
+```shell
+# Generate a CA
+openssl genrsa -passout pass:1234 -aes256 -out ca.key 4096
+openssl req -passin pass:1234 -new -x509 -days 365 -key ca.key -out ca.crt \
+  -subj "/C=US/ST=New Jersey/L=Fairfield/O=ACME Corp./OU=Falco/CN=Root CA"
+
+# Generate the server key and csr
+openssl genrsa -passout pass:1234 -aes256 -out server.key 4096
+openssl req -passin pass:1234 -new -key server.key -out server.csr \
+  -subj "/C=US/ST=New Jersey/L=Fairfield/O=ACME Corp./OU=Falco/CN=falco.{namespace}.svc"
+
+# Generate the server certificate
+openssl x509 -req -passin pass:1234 -days 365 -in server.csr -CA ca.crt -CAkey ca.key -set_serial 01 -out server.crt
+openssl rsa -passin pass:1234 -in server.key -out server.key
+
+# Once finished with the CA, remove the CA key
+rm ca.key
+```
+
+Then you can install the Falco chart enabling these flags:
+
+```
+helm install falco \
+  --set auditLog.enabled=true \
+  --set auditLog.dynamicBackend.enabled=true \
+  --set falco.webserver.sslEnabled=true
+  --set-file certs.server.key=/path/to/server.key \
+  --set-file certs.server.crt=/path/to/server.crt \
+  --set-file certs.ca.crt=/path/to/ca.crt \
+  falcosecurity/falco
+```
+
+
+### Without Dynamic Auditing
+
+You can do it with the [scripts provided by Falco engineers](https://github.com/falcosecurity/evolution/tree/master/examples/k8s_audit_config) just running:
 
 ```
 cd examples/k8s_audit_config
@@ -223,10 +285,12 @@ cd examples/k8s_audit_config
 APISERVER_HOST=api.my-kops-cluster.com bash ./enable-k8s-audit.sh kops dynamic
 ```
 
-Then you can install Falco chart enabling the enabling the `falco.webserver`
+Then you can install Falco chart enabling the `auditLog`
 flag:
 
-`helm install falco --set auditLog.enabled=true --set auditLog.dynamicBackend.enabled=true falcosecurity/falco`
+```
+helm install falco --set auditLog.enabled=true falcosecurity/falco
+```
 
 And that's it, you will start to see the K8s audit log related alerts.
 
